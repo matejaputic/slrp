@@ -3,14 +3,15 @@ package eval
 import (
 	"fmt"
 
+	"github.com/nfx/slrp/ql/ast"
 	"github.com/nfx/slrp/ql/internal"
 	"golang.org/x/exp/slices"
 )
 
-type Dataset[T any] struct {
-	Source    []T
+type Dataset[T any, D ~[]T] struct {
+	Source    D
 	Accessors Accessors
-	Facets    FacetRetrievers[T]
+	Facets    func(D, int) []Facet
 	Sorters   Sorters[T]
 }
 
@@ -20,21 +21,17 @@ type QueryResult[T any] struct {
 	Facets  []Facet
 }
 
-func (d Dataset[T]) Query(query string) (*QueryResult[T], error) {
+func (d Dataset[T, D]) Query(query string) (*QueryResult[T], error) {
 	plan, err := internal.Parse(query)
 	if err != nil {
 		return nil, err
-	}
-	less, err := d.Sorters.Sort(plan.Sort)
-	if err != nil {
-		return nil, fmt.Errorf("sort: %w", err)
 	}
 	optimized := d.Transform(*plan)
 	err, ok := d.IsFailure(optimized)
 	if ok {
 		return nil, err
 	}
-	result := []T{}
+	result := D{}
 	for i := 0; i < len(d.Source); i++ {
 		include, err := Filter(i, optimized)
 		if err != nil {
@@ -45,9 +42,24 @@ func (d Dataset[T]) Query(query string) (*QueryResult[T], error) {
 		}
 		result = append(result, d.Source[i])
 	}
-	// execute sort
+	if plan.Sort == nil {
+		plan.Sort = ast.Sort{}
+		for k, v := range d.Sorters {
+			if v.AscDefault || v.DescDefault {
+				plan.Sort = append(plan.Sort, ast.OrderBy{
+					Ident: k,
+					Asc:   v.AscDefault,
+				})
+			}
+		}
+	}
+	less, err := d.Sorters.Sort(plan.Sort)
+	if err != nil {
+		return nil, fmt.Errorf("sort: %w", err)
+	}
+	// TODO: consider rolling back to sort.SliceStable(),
+	// as field accessors might make things more complicated.
 	slices.SortStableFunc(result, less)
-	topN := 10
 	if plan.Limit == 0 {
 		plan.Limit = 20
 	}
@@ -57,6 +69,6 @@ func (d Dataset[T]) Query(query string) (*QueryResult[T], error) {
 	return &QueryResult[T]{
 		Total:   len(result),
 		Records: result[:plan.Limit],
-		Facets:  d.Facets.Facets(result, topN),
+		Facets:  d.Facets(result, plan.Limit),
 	}, nil
 }

@@ -20,6 +20,12 @@ func TestNewProxy(t *testing.T) {
 	}
 }
 
+func TestSocksToHttp(t *testing.T) {
+	p := NewProxy("1.2.4.5:8731", "socks4")
+	assert.Equal(t, "http://1.2.4.5:8731", p.AsHttp().String())
+	assert.Equal(t, "https://1.2.4.5:8731", p.AsHttps().String())
+}
+
 func TestProxyIP(t *testing.T) {
 	assert.Equal(t, net.IPv4(1, 2, 3, 4), HttpProxy("1.2.3.4:56789").IP())
 }
@@ -83,20 +89,20 @@ func TestDialProxiedConnection_SOCKS(t *testing.T) {
 func TestPickProxyFromContext(t *testing.T) {
 	p := HttpProxy("127.0.0.1:0")
 	r := p.MustNewGetRequest("https://ifconfig.me")
-	u, _ := pickHttpProxyFromContext(r)
+	u, _ := ProxyFromContext(r)
 	assert.Equal(t, u.String(), p.String())
 }
 
 func TestPickProxyFromContext_Tunnel(t *testing.T) {
 	p := Socks5Proxy("127.0.0.1:0")
 	r := p.MustNewGetRequest("https://ifconfig.me")
-	u, err := pickHttpProxyFromContext(r)
+	u, err := ProxyFromContext(r)
 	assert.Nil(t, u)
 	assert.NoError(t, err)
 }
 
 func TestPickProxyFromContext_NoProxy(t *testing.T) {
-	u, err := pickHttpProxyFromContext(&http.Request{})
+	u, err := ProxyFromContext(&http.Request{})
 	assert.Nil(t, u)
 	assert.NoError(t, err)
 }

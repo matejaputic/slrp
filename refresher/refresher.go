@@ -2,6 +2,7 @@ package refresher
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"sort"
@@ -11,7 +12,6 @@ import (
 	"github.com/nfx/slrp/app"
 	"github.com/nfx/slrp/pmux"
 	"github.com/nfx/slrp/pool"
-	"github.com/nfx/slrp/probe"
 	"github.com/nfx/slrp/sources"
 	"github.com/nfx/slrp/stats"
 
@@ -80,21 +80,37 @@ func (s *status) EstFinish(queued int) time.Time {
 
 type plan map[int]*status
 
+type task struct {
+	source *sources.Source
+	cancel func()
+}
+
+type req struct {
+	name string
+	cmd  string
+	err  chan error
+}
+
 type Refresher struct {
-	probe    probeContract
-	pool     poolContract
-	stats    statsContract
-	client   *http.Client
-	next     atomic.Value
-	progress chan progress
-	finish   chan finish
-	snapshot chan chan plan
-	sources  func() []sources.Source
-	plan     plan
+	probe        probeContract
+	pool         poolContract
+	stats        statsContract
+	client       *http.Client
+	next         atomic.Value
+	progress     chan progress
+	finish       chan finish
+	snapshot     chan chan plan
+	sources      func() []sources.Source
+	reqs         chan req
+	active       map[int]*task
+	plan         plan
+	enabled      bool
+	maxScheduled int
 }
 
 type probeContract interface {
 	Schedule(ctx context.Context, proxy pmux.Proxy, source int) bool
+	Forget(ctx context.Context, proxy pmux.Proxy, err error) bool
 }
 
 type poolContract interface {
@@ -107,15 +123,19 @@ type statsContract interface {
 	Snapshot() stats.Sources
 }
 
-func NewRefresher(stats *stats.Stats, pool *pool.Pool, probe *probe.Probe) *Refresher {
+func NewRefresher(stats *stats.Stats, pool *pool.Pool, probe probeContract) *Refresher {
 	return &Refresher{
-		probe:    probe,
-		pool:     pool,
-		stats:    stats,
-		finish:   make(chan finish, 1),
-		progress: make(chan progress),
-		snapshot: make(chan chan plan),
-		plan:     plan{},
+		probe:        probe,
+		pool:         pool,
+		stats:        stats,
+		finish:       make(chan finish, 1),
+		progress:     make(chan progress),
+		snapshot:     make(chan chan plan),
+		plan:         plan{},
+		reqs:         make(chan req),
+		active:       map[int]*task{},
+		enabled:      true,
+		maxScheduled: 5,
 		sources: func() []sources.Source {
 			return sources.Sources
 		},
@@ -123,6 +143,12 @@ func NewRefresher(stats *stats.Stats, pool *pool.Pool, probe *probe.Probe) *Refr
 			Transport: pool,
 		},
 	}
+}
+
+func (ref *Refresher) Configure(c app.Config) error {
+	ref.enabled = c.BoolOr("enabled", true)
+	ref.maxScheduled = c.IntOr("max_scheduled", 5)
+	return nil
 }
 
 func (ref *Refresher) Start(ctx app.Context) {
@@ -173,8 +199,17 @@ func (ref *Refresher) main(ctx app.Context) {
 			}
 			log := app.Log.From(f.ctx)
 			log.Info().Err(f.Err).Msg("finished refresh")
+			_, ok = ref.active[f.Source]
+			if ok {
+				delete(ref.active, f.Source)
+			}
 			ctx.Heartbeat()
+		case r := <-ref.reqs:
+			r.err <- ref.handleReq(r)
 		case <-start:
+			if !ref.enabled {
+				continue
+			}
 			next = ref.checkSources(ctx.Ctx(), next)
 			ref.next.Store(next)
 			log.Trace().
@@ -185,6 +220,23 @@ func (ref *Refresher) main(ctx app.Context) {
 	}
 }
 
+func (ref *Refresher) handleReq(r req) error {
+	s := sources.ByName(r.name)
+	if s.Name() == "unknown" {
+		return fmt.Errorf("invalid source '%s'", r.name)
+	}
+	ctx := context.Background()
+	ctx = app.Log.WithStr(ctx, "source", s.Name())
+	switch r.cmd {
+	case "start":
+		return ref.start(ctx, s)
+	case "stop":
+		return ref.stop(ctx, s)
+	default:
+		return fmt.Errorf("invalid command: %s", r.cmd)
+	}
+}
+
 func (ref *Refresher) Snapshot() plan {
 	out := make(chan plan)
 	defer close(out)
@@ -192,8 +244,66 @@ func (ref *Refresher) Snapshot() plan {
 	return <-out
 }
 
-func (ref *Refresher) HttpGet(_ *http.Request) (interface{}, error) {
+func (ref *Refresher) HttpGet(_ *http.Request) (any, error) {
 	return ref.upcoming(), nil
+}
+
+// start the source
+func (ref *Refresher) HttpPostByID(name string, r *http.Request) (any, error) {
+	res := make(chan error)
+	ref.reqs <- req{
+		name: name,
+		cmd:  "start",
+		err:  res,
+	}
+	return nil, <-res
+}
+
+func (ref *Refresher) start(ctx context.Context, source sources.Source) error {
+	log := app.Log.From(ctx)
+	log.Info().Msg("starting")
+	_, ok := ref.active[source.ID]
+	if ok {
+		return fmt.Errorf("source %s is running", source.Name())
+	}
+	client := ref.client
+	if source.Seed {
+		// TODO: wrap with history
+		client = http.DefaultClient
+	}
+	tctx, cancel := context.WithCancel(ctx)
+	ref.active[source.ID] = &task{
+		source: &source,
+		cancel: cancel,
+	}
+	go ref.refresh(tctx, client, source)
+	return nil
+}
+
+// stop the source
+func (ref *Refresher) HttpDeletetByID(name string, r *http.Request) (any, error) {
+	res := make(chan error)
+	ref.reqs <- req{
+		name: name,
+		cmd:  "stop",
+		err:  res,
+	}
+	return nil, <-res
+}
+
+func (ref *Refresher) stop(ctx context.Context, source sources.Source) error {
+	log := app.Log.From(ctx)
+	log.Info().Msg("stopping")
+	t, ok := ref.active[source.ID]
+	if !ok {
+		return fmt.Errorf("source %s was not running", source.Name())
+	}
+	if t.cancel == nil {
+		return fmt.Errorf("cannot cancel %s", source.Name())
+	}
+	t.cancel()
+	delete(ref.active, source.ID)
+	return nil
 }
 
 type upcoming struct {
@@ -249,14 +359,18 @@ var refreshDelay = 1 * time.Minute
 
 func (ref *Refresher) checkSources(ctx context.Context, trigger time.Time) time.Time {
 	minSourceFrequency := 60 * time.Minute
-	for _, v := range ref.sources() {
+	srcs := ref.sources()
+	for _, v := range srcs {
 		if v.Frequency < minSourceFrequency {
 			minSourceFrequency = v.Frequency
 		}
 	}
 	nextTrigger := time.Now().Add(minSourceFrequency)
 	snapshot := ref.stats.Snapshot()
-	for _, s := range ref.sources() {
+	for _, s := range srcs {
+		if len(ref.active) > ref.maxScheduled {
+			return trigger.Add(1 * time.Minute)
+		}
 		sctx := app.Log.WithStr(ctx, "source", s.Name())
 		log := app.Log.From(sctx)
 		if s.Feed == nil {
@@ -289,12 +403,7 @@ func (ref *Refresher) checkSources(ctx context.Context, trigger time.Time) time.
 			continue
 		}
 		log.Trace().Msg("scheduling refresh")
-		client := ref.client
-		if s.Seed {
-			// TODO: wrap with history
-			client = http.DefaultClient
-		}
-		go ref.refresh(sctx, client, s)
+		ref.start(sctx, s)
 	}
 	// TODO: maybe bring back nextTrigger someday
 	return trigger.Add(1 * time.Minute)
@@ -309,31 +418,21 @@ func (ref *Refresher) refresh(ctx context.Context, client *http.Client, source s
 	ref.stats.Launch(source.ID)
 	feed := source.Feed(ctx, client)
 	ref.progress <- progress{source.ID, 0}
-	for proxy := range feed.Generate(ctx) {
-		ctx := app.Log.WithStringer(ctx, "proxy", proxy)
-		if !ref.probe.Schedule(ctx, proxy, source.ID) {
+	for signal := range feed.Generate(ctx) {
+		ctx := app.Log.WithStringer(ctx, "proxy", signal.Proxy)
+		log := app.Log.From(ctx)
+		if !signal.Add {
+			log.Info().Err(signal.Err).Msg("forgetting proxy")
+			// let's see if it's not too aggressive
+			if !ref.probe.Forget(ctx, signal.Proxy, signal.Err) {
+				log.Warn().Msg("failed to forget")
+			}
+			continue
+		}
+		if !ref.probe.Schedule(ctx, signal.Proxy, source.ID) {
 			log.Warn().Msg("failed to schedule") // TODO: this happens too often
 		}
 		ref.progress <- progress{source.ID, feed.Len()}
-
-		// if proxy.Proto == pmux.HTTP {
-		// 	if !ref.probe.Schedule(ctx, pmux.Proxy{
-		// 		IP:    proxy.IP,
-		// 		Port:  proxy.Port,
-		// 		Proto: pmux.HTTPS,
-		// 	}, source.ID) {
-		// 		log.Warn().Msg("failed to schedule")
-		// 	}
-		// }
-		// if proxy.Proto == pmux.HTTPS {
-		// 	if !ref.probe.Schedule(ctx, pmux.Proxy{
-		// 		IP:    proxy.IP,
-		// 		Port:  proxy.Port,
-		// 		Proto: pmux.HTTP,
-		// 	}, source.ID) {
-		// 		log.Warn().Msg("failed to schedule")
-		// 	}
-		// }
 	}
 	// TODO: maybe update failed state from a secong goroutine?...
 	ref.stats.Finish(source.ID, feed.Err())

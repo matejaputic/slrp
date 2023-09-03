@@ -8,6 +8,7 @@ import (
 
 	"github.com/nfx/slrp/app"
 	"github.com/nfx/slrp/checker"
+	"github.com/nfx/slrp/dialer"
 	"github.com/nfx/slrp/history"
 	"github.com/nfx/slrp/internal/updater"
 	"github.com/nfx/slrp/ipinfo"
@@ -20,7 +21,7 @@ import (
 
 var version = "devel"
 
-//go:embed ui/build
+//go:embed ui/build/*
 var embedFrontend embed.FS
 
 func main() {
@@ -35,12 +36,14 @@ func main() {
 		"blacklist": probe.NewBlacklistApi,
 		"checker":   checker.NewChecker,
 		"dashboard": serve.NewDashboard,
+		"dialer":    dialer.NewDialer,
 		"history":   history.NewHistory,
 		"ipinfo":    ipinfo.NewLookup,
 		"mitm":      serve.NewMitmProxyServer,
 		"pool":      pool.NewPool,
 		"probe":     probe.NewProbe,
 		"refresher": refresher.NewRefresher,
+		"reverify":  probe.NewReverifyApi,
 		"stats":     stats.NewStats,
 		"ui":        app.MountSpaUI(embedFrontend),
 	})

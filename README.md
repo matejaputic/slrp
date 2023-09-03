@@ -57,17 +57,34 @@ Download service, start it up, wait couple of minutes for the pool to pick up. N
 
 ![proxies](docs/proxies.png)
 
-[http://localhost:8089/proxies](http://localhost:8089/proxies) provides search interface over active pool of found proxies. By default, entries are sorted by last working on top.
+[http://localhost:8089/proxies](http://localhost:8089/proxies) provides search interface over active pool of found proxies. By default, entries are sorted by last working on top. Query samples:
+
+* [`Proxy ~ socks`](http://localhost:8089/proxies?filter=Proxy+%7E+socks) - all SOCKS4 and SOCKS5 proxies
+* [`Proxy ~ http`](http://localhost:8089/proxies?filter=Proxy+%7E+http) - all HTTP and HTTPS proxies
+* [`Proxy ~ socks AND Succeed > 0`](http://localhost:8089/proxies?filter=Proxy+%7E+socks+AND+Succeed+%3E+0) - all SOCKS proxies that have ever succeeded
+* [`Proxy ~ socks AND Succeed > 0 ORDER BY Offered DESC`](http://localhost:8089/proxies?filter=Proxy+%7E+socks+AND+Succeed+%3E+0+ORDER+BY+Offered+DESC) - all SOCKS proxies that have ever succeeded ordered by the number of times attempted
+* [`Country:DE OR Country:UK`](http://localhost:8089/proxies?filter=Country%3ADE+OR+Country%3AUK) - proxies from Germany or the United Kingdom
+* [`Offered > 0 AND Succeed:0 ORDER BY ReanimateAfter DESC`](http://localhost:8089/proxies?filter=Offered+%3E+0+AND+Succeed%3A0+ORDER+BY+ReanimateAfter+DESC) - candidates for eviction
 
 ## History
 
 ![history](docs/history.png)
 
-[http://localhost:8089/history](http://localhost:8089/history) provides search interface over last 1000 forwarding attempts (configurable).
+[http://localhost:8089/history](http://localhost:8089/history) provides search interface over the last 1000 forwarding attempts (configurable). Sample queries:
+
+* [`URL ~ "proxynova.com" AND StatusCode < 400`](http://localhost:8089/history?filter=URL+%7E+%22proxynova.com%22+AND+StatusCode+%3C+400) - all non-failed attempts to URL containing `proxynova.com`.
+
+## Reverify
+
+[http://localhost:8089/reverify](http://localhost:8089/reverify) provides search interface over timed out probes. Sample queries:
+
+* [`Country:CN`](http://localhost:8089/reverify?filter=Country:CN) - all timed out proxies from China
 
 ## Blacklist
 
-[http://localhost:8089/blacklist](http://localhost:8089/blacklist) provides search interface over unsuccessful probes.
+[http://localhost:8089/blacklist](http://localhost:8089/blacklist) provides search interface over unsuccessful probes. Sample queries:
+
+* [`Failure ~ "this IP address found"`](http://localhost:8089/blacklist?filter=Failure%20~%20%22this%20IP%20address%20found%22) - all transparent proxies.
 
 # Configuration
 
@@ -113,6 +130,27 @@ Fabric that holds application components together.
 * `state` - where data persists on disk through restarts of the application. Default is `.slrp/data` of your home directory.
 * `sync` - how often data is synchronised to disk, pending availability of any updates of component state. Default is every minute.
 
+## dialer
+
+[WireGuard](https://www.wireguard.com/) userspace VPN dialer configuration. Embeds the official [Go implementation](https://git.zx2c4.com/wireguard-go). Disabled by default.
+
+* `wireguard_config_file` - [configuration file](https://www.wireguard.com/#cryptokey-routing) from WireGuard. IPv6 address parsing is ignored at the moment.
+* `wireguard_verbose` - verbose logging mode for WireGuard tunnel.
+
+Sample WireGuard configuration file:
+
+```ini
+[Interface]
+PrivateKey = gI6EdUSYvn8ugXOt8QQD6Yc+JyiZxIhp3GInSWRfWGE=
+Address = 1.2.3.4/24
+DNS =  1.2.3.4
+
+[Peer]
+PublicKey = HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=
+Endpoint = 1.2.3.4:51820
+AllowedIPs = 0.0.0.0/0
+```
+
 ## log
 
 Structured logging meta-components.
@@ -128,6 +166,33 @@ API and UI serving component.
 * `addr` - address of listening HTTP server. Default is [http://127.0.0.1:8089](http://127.0.0.1:8089).
 * `read_timeout` - default is `15s`.
 * `enable_profiler` - either or not enabling profiler endpoints. Default is `false`. Developer use only.
+
+## pool
+
+Proxy pool maintenance.
+
+* `request_workers` - number of workers to perform outgoing HTTP requests. Defaults to `512`.
+* `request_timeout` - outgoing HTTP request timeout. defaults to `10s`.
+* `shards` - number of shards. Defaults to `1`. This property may go away.
+* `evict_span_minutes` - number of minutes to identify the latest span of time for rolling counters. Defaults to `5`.
+* `short_timeout_sleep` - time to remove a proxy from routing after the first timeout or error.
+* `long_timeout_sleep` - time to remove a proxy from routing after `evict_threshold_timeouts` within the last `evict_span_minutes`.
+* `evict_threshold_timeouts` - used with `long_timeout_sleep`. Defaults to `3`.
+* `evict_threshold_failures` - number of failures within the last `evict_span_minutes` to evict proxy from the pool.
+* `evict_threshold_reanimations` - number of any proxy sleeps ever to evict proxy from the pool.
+
+## probe
+
+Proxy probing component.
+
+* `enable_http_rescue` - experimental feature to enable rescuing HTTP proxies, that were presented as SOCKS5 or HTTPS. Detected based on protocol probe heuristics. Defaults to false.
+
+## refresher
+
+Source refresh component.
+
+* `enabled` - run the refresher. Enabled by default.
+* `max_scheduled` - number of sources to refresh at the same time. Defaults to 5.
 
 ## mitm
 
@@ -173,20 +238,41 @@ Get information about refresh status for all sources
 
 Get 20 last used proxies
 
+## POST `/api/refresher/{source_name}`
+
+Start refreshing the source
+
+## DELETE `/api/refresher/{source_name}`
+
+Stop refreshing the source
+
 ## GET `/api/history`
 
 Get 100 last forwarding attempts
 
-## GET `/api/history/:id`
+## GET `/api/history/{id}`
 
 Get sanitized HTTP response from forwarding attempt
+
+## GET `/api/reverify`
+
+Get first 20 timed out items that are in the reverify pool
 
 ## GET `/api/blacklist`
 
 Get first 20 blacklisted items sorted by proxy along with common error stats
+
+# Developing
+
+UI development requires `npm` installed. Once you have it, please `npm install vite typescript -g`.
 
 # References
 
 * [ProxyBroker](https://github.com/constverum/ProxyBroker) is pretty similar project in nature. Requires couple of Python module dependencies and had the last commit in March 2019. 
 * [Scylla](https://github.com/imWildCat/scylla) is pretty similar project in nature. Requires couple of Python module dependencies.
 * [ProxyBuilder](https://github.com/jetkai/proxy-builder-2)
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=nfx/slrp&type=Date)](https://star-history.com/#nfx/slrp)
+
