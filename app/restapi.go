@@ -131,7 +131,7 @@ func newServer(fabric *Fabric) *mainServer {
 }
 
 func (s *mainServer) Configure(c Config) (err error) {
-	s.Addr = c.StrOr("addr", "localhost:8089")
+	s.Addr = c.StrOr("addr", "0.0.0.0:8089")
 	timeout := c.DurOr("read_timeout", 15*time.Second)
 	s.ReadTimeout = timeout
 	s.IdleTimeout = timeout

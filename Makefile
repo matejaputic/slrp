@@ -1,6 +1,7 @@
 default: build
 
 build-ui:
+	npm install --prefix ui
 	npm --prefix ui run build
 
 dev-ui:
